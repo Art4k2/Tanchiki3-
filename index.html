@@ -173,6 +173,62 @@ const Vec2 = {
     }
 };
 
+/* --- ШАГ 1: ЗАМЕНИ ЭТОТ БЛОК --- */
+const GeoUtils = {
+    // Вычисляет грани танка для честных хитбоксов
+    getTankSegments: (tr, spec) => {
+        const s = 22; 
+        const pos = tr.pos;
+        const rot = tr.rotation;
+        let localPts = [];
+
+        // Определяем форму хитбокса
+        if (spec.shape === 'square') {
+            localPts = [{x:s,y:-s,z:'F'}, {x:s,y:s,z:'F'}, {x:-s,y:s,z:'S'}, {x:-s,y:-s,z:'R'}];
+        } else if (spec.shape === 'triangle') {
+            localPts = [{x:s,y:0,z:'F'}, {x:-s,y:s,z:'S'}, {x:-s,y:-s,z:'R'}];
+        } else if (spec.shape === 'rhombus') {
+            localPts = [{x:s,y:0,z:'F'}, {x:0,y:s*0.7,z:'S'}, {x:-s,y:0,z:'R'}, {x:0,y:-s*0.7,z:'S'}];
+        } else {
+            for(let i=0; i<5; i++) {
+                const a = i * Math.PI*2/5;
+                localPts.push({x:Math.cos(a)*s, y:Math.sin(a)*s, z: i===0?'F':(i<3?'S':'R')});
+            }
+        }
+
+        const global = localPts.map(p => ({
+            x: pos.x + p.x * Math.cos(rot) - p.y * Math.sin(rot),
+            y: pos.y + p.x * Math.sin(rot) + p.y * Math.cos(rot),
+            zone: p.z
+        }));
+
+        const segments = [];
+        for(let i=0; i<global.length; i++) {
+            segments.push({ p1: global[i], p2: global[(i+1)%global.length], zone: global[i].zone });
+        }
+        return segments;
+    },
+
+    // Пересечение луча и грани
+    intersect: (p1, p2, p3, p4) => {
+        const det = (p2.x - p1.x) * (p4.y - p3.y) - (p2.y - p1.y) * (p4.x - p3.x);
+        if (det === 0) return null;
+        const t = ((p3.x - p1.x) * (p4.y - p3.y) - (p3.y - p1.y) * (p4.x - p3.x)) / det;
+        const u = ((p3.x - p1.x) * (p2.y - p1.y) - (p3.y - p1.y) * (p2.x - p1.x)) / det;
+        return (t >= 0 && t <= 1 && u >= 0 && u <= 1) ? { x: p1.x + t * (p2.x - p1.x), y: p1.y + t * (p2.y - p1.y), t } : null;
+    },
+
+    // Математика рикошета (отражение вектора)
+    reflect: (dir, p1, p2) => {
+        const dx = p2.x - p1.x, dy = p2.y - p1.y;
+        const nx = -dy, ny = dx; 
+        const len = Math.sqrt(nx*nx + ny*ny);
+        const n = { x: nx/len, y: ny/len };
+        const dot = dir.x * n.x + dir.y * n.y;
+        return { x: dir.x - 2 * dot * n.x, y: dir.y - 2 * dot * n.y };
+    }
+};
+
 // --- 3. ECS CORE (Гибкая система из Code 2) ---
 class Entity {
     constructor(id) { this.id = id; this.components = {}; }
@@ -346,127 +402,92 @@ class MovementSystem {
 }
 
 // --- 8. COMBAT SYSTEM (Rays & Armor Calculation) ---
+/* --- ШАГ 2: ПОЛНОСТЬЮ ЗАМЕНИ ЭТОТ КЛАСС --- */
 class CombatSystem {
-    constructor(world) { this.world = world; }
-    
-    update(entities, dt) {
-        entities.forEach(shooter => {
-            if (!shooter.hasComponent('TankData')) return;
-            const data = shooter.getComponent('TankData');
-            const inp = shooter.getComponent('InputState').keys;
-
-            // Перезарядка
-            if (data.reloadTimer > 0) data.reloadTimer -= dt;
-
-            // Выстрел
-            if (inp.fire && data.reloadTimer <= 0) {
-                this.fire(shooter);
-                data.reloadTimer = data.spec.reload;
-            }
-        });
+    constructor(world) { 
+        this.world = world;
+        this.walls = [ // Добавляем физические стены на карту
+            {p1: {x:200, y:-300}, p2: {x:200, y:300}},
+            {p1: {x:-300, y:150}, p2: {x:400, y:150}}
+        ];
     }
 
-    fire(shooter) {
-        const tr = shooter.getComponent('Transform');
-        const data = shooter.getComponent('TankData');
-        
-        // Точка вылета (дуло)
-        const offset = 35;
-        const start = {
-            x: tr.pos.x + Math.cos(data.turretRotation) * offset,
-            y: tr.pos.y + Math.sin(data.turretRotation) * offset
-        };
-        const dir = { x: Math.cos(data.turretRotation), y: Math.sin(data.turretRotation) };
-
-        // Raycast
-        let bestHit = null;
-        let minDist = 1000;
-
-        this.world.entities.forEach(target => {
-            if (target === shooter || !target.hasComponent('TankData')) return;
-            
-            // Упрощенная коллизия (круг) для быстродействия
-            const tTr = target.getComponent('Transform');
-            
-            // Проекция точки центра танка на луч
-            const vToTarget = { x: tTr.pos.x - start.x, y: tTr.pos.y - start.y };
-            const dot = vToTarget.x * dir.x + vToTarget.y * dir.y;
-            
-            if (dot > 0) { // Если танк спереди
-                const closestPoint = { x: start.x + dir.x * dot, y: start.y + dir.y * dot };
-                const distToRay = Vec2.dist(closestPoint, tTr.pos);
-                
-                if (distToRay < 25) { // Попали в хитбокс (радиус 25)
-                    const dist = Vec2.dist(start, closestPoint);
-                    if (dist < minDist) {
-                        minDist = dist;
-                        bestHit = { entity: target, pos: closestPoint };
-                    }
+    update(entities, dt) {
+        entities.forEach(e => {
+            if (e.hasComponent('TankData')) {
+                const d = e.getComponent('TankData');
+                if (d.reloadTimer > 0) d.reloadTimer -= dt;
+                if (e.getComponent('InputState').keys.fire && d.reloadTimer <= 0) {
+                    this.shoot(e);
+                    d.reloadTimer = d.spec.reload;
                 }
             }
         });
+    }
 
-        const end = bestHit ? bestHit.pos : { x: start.x + dir.x * 1000, y: start.y + dir.y * 1000 };
+    shoot(shooter) {
+        const tr = shooter.getComponent('Transform');
+        const data = shooter.getComponent('TankData');
+        let start = { x: tr.pos.x, y: tr.pos.y };
+        let dir = { x: Math.cos(data.turretRotation), y: Math.sin(data.turretRotation) };
+        this.castRay(shooter, start, dir, 0);
+    }
+
+    castRay(shooter, start, dir, bounce) {
+        if (bounce > 2) return; // Максимум 2 рикошета
+
+        const end = { x: start.x + dir.x * 1200, y: start.y + dir.y * 1200 };
+        let closest = null;
+
+        // Проверка столкновения с гранями ТАНКОВ
+        this.world.entities.forEach(target => {
+            if (target === shooter || !target.hasComponent('TankData')) return;
+            const segments = GeoUtils.getTankSegments(target.getComponent('Transform'), target.getComponent('TankData').spec);
+            segments.forEach(seg => {
+                const hit = GeoUtils.intersect(start, end, seg.p1, seg.p2);
+                if (hit && (!closest || hit.t < closest.t)) 
+                    closest = { ...hit, type: 'tank', entity: target, segment: seg };
+            });
+        });
+
+        // Проверка столкновения со СТЕНАМИ
+        this.walls.forEach(wall => {
+            const hit = GeoUtils.intersect(start, end, wall.p1, wall.p2);
+            if (hit && (!closest || hit.t < closest.t)) 
+                closest = { ...hit, type: 'wall', segment: wall };
+        });
+
+        const hitPos = closest ? {x: closest.x, y: closest.y} : end;
+        this.world.createEntity().addComponent(new RayVisual(start, hitPos));
+
+        if (closest) {
+            const reflectDir = GeoUtils.reflect(dir, closest.segment.p1, closest.segment.p2);
+            if (closest.type === 'tank') {
+                this.handleTankHit(shooter, closest, dir, reflectDir, bounce);
+            } else {
+                this.castRay(shooter, hitPos, reflectDir, bounce + 1);
+            }
+        }
+    }
+
+    handleTankHit(shooter, hit, oldDir, newDir, bounce) {
+        const target = hit.entity.getComponent('TankData');
+        const armor = (hit.segment.zone === 'F') ? target.spec.armor.front : (hit.segment.zone === 'R' ? target.spec.armor.rear : target.spec.armor.side);
         
-        // Визуализация луча
-        this.world.createEntity().addComponent(new RayVisual(start, end));
-
-        // Нанесение урона
-        if (bestHit) {
-            this.resolveHit(shooter, bestHit.entity, dir);
+        // Условие рикошета: если угол падения слишком острый
+        const dot = Math.abs(oldDir.x * (hit.segment.p1.x - hit.segment.p2.x) + oldDir.y * (hit.segment.p1.y - hit.segment.p2.y));
+        
+        if (dot < 10 || armor > 150) { // Рикошет
+            this.castRay(shooter, {x: hit.x, y: hit.y}, newDir, bounce + 1);
+        } else { // Пробитие
+            target.hp -= shooter.getComponent('TankData').spec.dmg;
+            if (target.hp <= 0) { 
+                hit.entity.getComponent('Transform').pos = {x: (Math.random()-0.5)*1000, y: (Math.random()-0.5)*1000};
+                target.hp = target.spec.hp;
+            }
         }
-    }
-
-    resolveHit(shooter, target, shotDir) {
-        const tTr = target.getComponent('Transform');
-        const tData = target.getComponent('TankData');
-        const sData = shooter.getComponent('TankData');
-
-        // Определяем зону попадания (сравниваем угол выстрела и поворот танка)
-        const shotAngle = Math.atan2(shotDir.y, shotDir.x);
-        // Угол попадания относительно носа танка
-        let impactAngle = Vec2.angleDiff(tTr.rotation, shotAngle);
-        impactAngle = Math.abs(impactAngle); // 0 = в корму, PI = в лоб
-
-        let armor = 0;
-        let zone = '';
-
-        // Логика зон пробития (Лоб/Борт/Корма)
-        if (impactAngle > 2.5) { zone = 'FRONT'; armor = tData.spec.armor.front; }
-        else if (impactAngle < 0.8) { zone = 'REAR'; armor = tData.spec.armor.rear; }
-        else { zone = 'SIDE'; armor = tData.spec.armor.side; }
-
-        // Расчет урона (База + Рандом - Броня/2) -> Упростим для играбельности
-        // Если пробой > брони -> полный урон.
-        // Эмулируем пробитие: 
-        const penetration = 200; // Условное пробитие снаряда
-        let dmg = 0;
-
-        if (penetration >= armor) {
-            dmg = sData.spec.dmg * (0.8 + Math.random() * 0.4); // +/- 20%
-            tData.hp -= dmg;
-            console.log(`Hit ${zone}! DMG: ${Math.round(dmg)}`);
-        } else {
-            console.log(`RICOCHET on ${zone}!`);
-            // Рикошет можно визуализировать короткой искрой
-        }
-
-        // Смерть
-        if (tData.hp <= 0) {
-            this.respawn(target);
-        }
-    }
-
-    respawn(entity) {
-        const tData = entity.getComponent('TankData');
-        const tr = entity.getComponent('Transform');
-        tData.hp = tData.spec.hp;
-        // Респаун в случайной точке подальше
-        tr.pos.x = (Math.random() - 0.5) * 1000;
-        tr.pos.y = (Math.random() - 0.5) * 1000;
     }
 }
-
 // --- 9. RENDER SYSTEM (Визуал) ---
 class RenderSystem {
     constructor() {
@@ -525,7 +546,15 @@ class RenderSystem {
             ctx.moveTo(-range, i); ctx.lineTo(range, i);
         }
         ctx.stroke();
-
+        /* --- ШАГ 3: ВСТАВЬ ВНУТРЬ RenderSystem.update --- */
+ctx.strokeStyle = '#fff'; ctx.lineWidth = 4;
+const combat = this.world.systems.find(s => s instanceof CombatSystem);
+if (combat) {
+    combat.walls.forEach(w => {
+        ctx.beginPath(); ctx.moveTo(w.p1.x, w.p1.y); ctx.lineTo(w.p2.x, w.p2.y); ctx.stroke();
+    });
+}
+        
         // Отрисовка сущностей
         entities.forEach(e => {
             // ТАНКИ
